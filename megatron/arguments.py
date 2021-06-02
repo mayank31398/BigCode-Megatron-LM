@@ -20,6 +20,7 @@ import os
 import re
 
 import torch
+import deepspeed
 
 import megatron
 from megatron.model.enums import PositionEmbeddingType
@@ -50,6 +51,9 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Custom arguments.
     if extra_args_provider is not None:
         parser = extra_args_provider(parser)
+
+    parser = deepspeed.add_config_arguments(parser)
+    parser = _add_extra_deepspeed_args(parser)
 
     # Parse.
     if ignore_unknown_args:
@@ -1198,4 +1202,26 @@ def _add_vision_args(parser):
     group.add_argument('--dino-warmup-teacher-temp-epochs', type=int, default=30,
                        help='warmup teacher temperaure epochs')
 
+    return parser
+
+def _add_extra_deepspeed_args(parser):
+    group = parser.add_argument_group(title="deepspeed-extras")
+    group.add_argument('--cpu-optimizer', action='store_true',
+                       help='Run optimizer on CPU')
+    group.add_argument('--remote-device', type=str, default='none', choices=['none', 'cpu', 'nvme'],
+                      help='Remote device for ZeRO-3 initialized parameters.')
+    group.add_argument("--zero-stage", type=int, default=1)
+
+    group.add_argument('--deepspeed-activation-checkpointing', action='store_true',
+                       help='uses activation checkpointing from deepspeed')
+    group.add_argument('--partition-activations', action='store_true',
+                       help='partition Activations across GPUs before checkpointing.')
+    group.add_argument('--contigious-checkpointing', action='store_true',
+                       help='Contigious memory checkpointing for activatoins.')
+    group.add_argument('--checkpoint-in-cpu', action='store_true',
+                       help='Move the activation checkpoints to CPU.')
+    group.add_argument('--synchronize-each-layer', action='store_true',
+                       help='does a synchronize at the beginning and end of each checkpointed layer.')
+    group.add_argument('--profile-backward', action='store_true',
+                       help='Enables backward pass profiling for checkpointed layers.')
     return parser

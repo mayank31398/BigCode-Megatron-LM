@@ -126,7 +126,11 @@ def forward_step(forward_step_func,
         input_tensor = [input_tensor]
         unwrap_output_tensor = True
 
-    unwrapped_model.set_input_tensor(input_tensor)
+    if not args.deepspeed:
+        unwrapped_model.set_input_tensor(input_tensor)
+    else:
+        unwrapped_model.module.set_input_tensor(input_tensor)
+
     output_tensor, loss_func = forward_step_func(data_iterator, model)
     if mpu.is_pipeline_last_stage():
         if not collect_non_loss_data:
@@ -151,7 +155,7 @@ def forward_step(forward_step_func,
     return [output_tensor]
 
 
-def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad):
+def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad, model):
     """Backward step through passed-in output tensor.
 
     If last stage, output_tensor_grad is None, otherwise gradient of loss
@@ -182,10 +186,12 @@ def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad):
     if not isinstance(output_tensor_grad, list):
         output_tensor_grad = [output_tensor_grad]
 
-    # Backward pass.
-    if output_tensor_grad[0] is None:
-        output_tensor = optimizer.scale_loss(output_tensor[0])
-    custom_backward(output_tensor[0], output_tensor_grad[0])
+    if args.deepspeed:
+        model.backward(output_tensor[0])
+    else:
+        if output_tensor_grad[0] is None:
+            output_tensor = optimizer.scale_loss(output_tensor[0])
+        custom_backward(output_tensor[0], output_tensor_grad[0])
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
@@ -246,7 +252,7 @@ def forward_backward_no_pipelining(forward_step_func,
                                          collect_non_loss_data)
             if not forward_only:
                 backward_step(optimizer, input_tensor, output_tensor,
-                              output_tensor_grad)
+                              output_tensor_grad, model)
 
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
@@ -254,7 +260,7 @@ def forward_backward_no_pipelining(forward_step_func,
                                  model, input_tensor, forward_data_store,
                                  collect_non_loss_data)
     if not forward_only:
-        backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad)
+        backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad, model)
 
     return forward_data_store
 

@@ -79,6 +79,9 @@ def get_megatron_optimizer(model,
                            lr_mult=1.0):
     args = get_args()
 
+    if args.cpu_optimizer:
+        raise NotImplementedError('need to add cpu adam')
+
     # Base optimizer.
     param_groups = get_param_groups(model,
                                     no_weight_decay_cond,
@@ -99,6 +102,9 @@ def get_megatron_optimizer(model,
     else:
         raise Exception('{} optimizer is not supported.'.format(
             args.optimizer))
+
+    if args.deepspeed:
+        return optimizer
 
     # Determine whether the params have main-grad field.
     params_have_main_grad = False
