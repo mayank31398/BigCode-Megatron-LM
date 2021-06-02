@@ -180,9 +180,6 @@ def custom_backward(output, grad_output):
     )
 
 
-
-
-
 def forward_step(forward_step_func,
                  data_iterator,
                  model,
@@ -209,6 +206,12 @@ def forward_step(forward_step_func,
 
     set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
     set_input_tensor(input_tensor)
+
+    # REVIEW probably not necessary
+    # if use_deepspeed:
+    #     unwrapped_model.set_input_tensor(input_tensor)
+    # else:
+    #     unwrapped_model.module.set_input_tensor(input_tensor)
 
     if enable_autocast:
         context_manager = torch.autocast("cuda", dtype=autocast_dtype)
@@ -244,7 +247,8 @@ def forward_step(forward_step_func,
 
 
 def backward_step(grad_scaler, input_tensor, output_tensor,
-                  output_tensor_grad, model_type, timers, deallocate_pipeline_outputs=False):
+                  output_tensor_grad, model_type, timers, deallocate_pipeline_outputs=False,
+                  model=None, use_deepspeed=False):
     """Backward step through passed-in output tensor.
 
     If last stage, output_tensor_grad is None, otherwise gradient of loss
@@ -277,11 +281,14 @@ def backward_step(grad_scaler, input_tensor, output_tensor,
     # Backward pass.
     if output_tensor_grad[0] is None and grad_scaler is not None:
         output_tensor = grad_scaler(output_tensor[0])
-    
-    if deallocate_pipeline_outputs:
-        custom_backward(output_tensor[0], output_tensor_grad[0])
+
+    if use_deepspeed:
+        model.backward(output_tensor[0])
     else:
-        torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+        if deallocate_pipeline_outputs:
+            custom_backward(output_tensor[0], output_tensor_grad[0])
+        else:
+            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
@@ -327,6 +334,7 @@ def forward_backward_no_pipelining(*,
                                    no_sync_func: Optional[Callable] = None,
                                    grad_sync_func: Optional[Callable] = None, # unused
                                    param_sync_func: Optional[Callable] = None, # unused
+                                   use_deepspeed: bool = False,
                                    ):
     """Run forward and backward passes with no pipeline parallelism
     (no inter-stage communication).
@@ -362,7 +370,8 @@ def forward_backward_no_pipelining(*,
                                          timers, collect_non_loss_data, dtype, enable_autocast)
             if not forward_only:
                 backward_step(grad_scaler, input_tensor, output_tensor,
-                              output_tensor_grad, model_type, timers, deallocate_pipeline_outputs)
+                              output_tensor_grad, model_type, timers, deallocate_pipeline_outputs,
+                              model=model, use_deepspeed=use_deepspeed)
 
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
@@ -372,7 +381,8 @@ def forward_backward_no_pipelining(*,
 
     if not forward_only:
         backward_step(grad_scaler, input_tensor, output_tensor,
-                      output_tensor_grad, model_type, timers, deallocate_pipeline_outputs)
+                      output_tensor_grad, model_type, timers, deallocate_pipeline_outputs,
+                      model=model, use_deepspeed=use_deepspeed)
 
     return forward_data_store
 
@@ -395,6 +405,7 @@ def forward_backward_pipelining_with_interleaving(*,
                                                   no_sync_func: Optional[Callable] = None,
                                                   grad_sync_func: Optional[Callable] = None,
                                                   param_sync_func: Optional[Callable] = None,
+                                                  use_deepspeed: bool = False,
                                                   ):
     """Run interleaved 1F1B schedule (model split into model chunks), with
     communication between pipeline stages as needed.
@@ -596,7 +607,9 @@ def forward_backward_pipelining_with_interleaving(*,
                           output_tensor_grad,
                           model_type,
                           timers,
-                          deallocate_pipeline_outputs)
+                          deallocate_pipeline_outputs,
+                          model=model,
+                          use_deepspeed=use_deepspeed)
 
         # launch grad synchronization (custom grad sync)
         # Note: Asynchronous communication tends to slow down compute.
@@ -889,6 +902,7 @@ def forward_backward_pipelining_without_interleaving(*,
                                                      no_sync_func: Optional[Callable] = None,
                                                      grad_sync_func: Optional[Callable] = None,
                                                      param_sync_func: Optional[Callable] = None, # unused
+                                                     use_deepspeed: bool = False,
                                                      ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages.
@@ -1007,7 +1021,8 @@ def forward_backward_pipelining_without_interleaving(*,
 
             input_tensor_grad = \
                 backward_step(grad_scaler, input_tensor, output_tensor,
-                              output_tensor_grad, model_type, timers, deallocate_pipeline_outputs)
+                              output_tensor_grad, model_type, timers, deallocate_pipeline_outputs,
+                              model=model, use_deepspeed=use_deepspeed)
 
             if last_iteration:
                 input_tensor = None
@@ -1037,7 +1052,8 @@ def forward_backward_pipelining_without_interleaving(*,
 
             input_tensor_grad = \
                 backward_step(grad_scaler, input_tensor, output_tensor,
-                              output_tensor_grad, model_type, timers, deallocate_pipeline_outputs)
+                              output_tensor_grad, model_type, timers, deallocate_pipeline_outputs,
+                              model=model, use_deepspeed=use_deepspeed)
 
             send_backward(input_tensor_grad, recv_tensor_shapes, timers=timers)
 

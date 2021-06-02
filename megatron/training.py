@@ -47,6 +47,8 @@ from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 from megatron.data.dataset_utils import analyze_data_prefix
 
+import deepspeed
+
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -290,6 +292,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             sum([sum([p.nelement() for p in model_module.parameters()])
                  for model_module in model])), flush=True)
 
+    if args.deepspeed:
+        assert mpu.get_pipeline_model_parallel_world_size() == 1, 'deepspeed does not support megatron PP'
+        return model
+
     # GPU allocation.
     for model_module in model:
         model_module.cuda(torch.cuda.current_device())
@@ -386,6 +392,17 @@ def setup_model_and_optimizer(model_provider_func,
                                        scale_lr_cond, lr_mult)
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
+    if args.deepspeed:
+        print_rank_0("DeepSpeed is enabled.")
+        model, optimizer, _, opt_param_scheduler = deepspeed.initialize(
+            model=model[0],
+            optimizer=optimizer,
+            args=args,
+            lr_scheduler=opt_param_scheduler,
+            mpu=mpu
+        )
+        model = [model]
+
     if args.load is not None:
         timers = get_timers()
         timers('load-checkpoint', log_level=0).start(barrier=True)
@@ -418,10 +435,11 @@ def train_step(forward_step_func, data_iterator,
     timers = get_timers()
 
     # Set grad to zero.
-    if args.DDP_impl == 'local' and args.use_contiguous_buffers_in_local_ddp:
-        for partition in model:
-            partition.zero_grad_buffer()
-    optimizer.zero_grad()
+    if not args.deepspeed:
+        if args.DDP_impl == 'local' and args.use_contiguous_buffers_in_local_ddp:
+            for partition in model:
+                partition.zero_grad_buffer()
+        optimizer.zero_grad()
 
     # Forward pass.
     timers('forward-backward', log_level=1).start(
@@ -438,7 +456,8 @@ def train_step(forward_step_func, data_iterator,
         grad_scaler=optimizer.scale_loss,
         sequence_parallel=args.sequence_parallel,
         forward_only=False,
-        timers=fwd_bwd_timers)
+        timers=fwd_bwd_timers,
+        use_deepspeed=args.deepspeed)
     timers('forward-backward').stop()
 
     # Empty unused memory.
@@ -446,50 +465,64 @@ def train_step(forward_step_func, data_iterator,
         torch.cuda.empty_cache()
 
     # Reduce gradients.
-    optimizer.reduce_model_grads(args, timers)
+    if args.deepspeed:
+        if args.vision_pretraining:
+            raise NotImplementedError()
+    else:
+        optimizer.reduce_model_grads(args, timers)
 
-    # Vision gradients.
-    if args.vision_pretraining and args.vision_pretraining_type == "dino":
-        unwrapped_model = unwrap_model(model[0],
-                                       (torchDDP, LocalDDP, Float16Module))
-        unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
+        # Vision gradients.
+        if args.vision_pretraining and args.vision_pretraining_type == "dino":
+            unwrapped_model = unwrap_model(model[0],
+                                        (torchDDP, LocalDDP, Float16Module))
+            unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
+
+    increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
 
     # Update parameters.
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
+    if args.deepspeed:
+        model[0].step(lr_kwargs={'increment': increment})
+    else:
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
     timers('optimizer').stop()
 
     # Gather params.
-    if update_successful:
+    if not args.deepspeed and update_successful:
         optimizer.gather_model_params(args, timers)
 
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
+        if args.deepspeed:
+            raise NotImplementedError()
+
         unwrapped_model = unwrap_model(model[0],
                                        (torchDDP, LocalDDP, Float16Module))
         unwrapped_model.update_momentum(args.curr_iteration)
 
     # Update learning rate.
-    if update_successful:
-        increment = get_num_microbatches() * \
-                    args.micro_batch_size * \
-                    args.data_parallel_size
-        opt_param_scheduler.step(increment=increment)
+    if args.deepspeed:
         skipped_iter = 0
+        grad_norm = None
+        num_zeros_in_grad = None
     else:
-        skipped_iter = 1
+        if update_successful:
+            opt_param_scheduler.step(increment=increment)
+            skipped_iter = 0
+        else:
+            skipped_iter = 1
 
-    # Empty unused memory.
-    if args.empty_unused_memory_level >= 2:
-        torch.cuda.empty_cache()
-
-    if mpu.is_pipeline_last_stage(ignore_virtual=True):
-        # Average loss across microbatches.
-        loss_reduced = {}
-        for key in losses_reduced[0]:
-            losses_reduced_for_key = [x[key] for x in losses_reduced]
-            loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
-        return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
+        # Empty unused memory.
+        if args.empty_unused_memory_level >= 2:
+            torch.cuda.empty_cache()
+    
+        if mpu.is_pipeline_last_stage(ignore_virtual=True):
+            # Average loss across microbatches.
+            loss_reduced = {}
+            for key in losses_reduced[0]:
+                losses_reduced_for_key = [x[key] for x in losses_reduced]
+                loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
+            return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
     return {}, skipped_iter, grad_norm, num_zeros_in_grad
 
 
@@ -745,7 +778,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                        get_num_microbatches()
 
         # Logging.
-        loss_scale = optimizer.get_loss_scale().item()
+        if args.deepspeed:
+            loss_scale = -1
+        else:
+            loss_scale = optimizer.get_loss_scale().item()
         params_norm = None
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
@@ -851,7 +887,8 @@ def evaluate(forward_step_func,
                 tensor_shape=(args.seq_length, args.micro_batch_size, args.hidden_size),
                 sequence_parallel=args.sequence_parallel,
                 forward_only=True,
-                timers=None)
+                timers=None,
+                use_deepspeed=args.deepspeed)
 
             # Empty unused memory
             if args.empty_unused_memory_level >= 1:
@@ -871,7 +908,7 @@ def evaluate(forward_step_func,
         if process_non_loss_data_func is not None and is_last_rank():
             collected_non_loss_data = forward_backward_func(
                 forward_step_func, data_iterator, model, optimizer=None,
-                timers=None, forward_only=True, collect_non_loss_data=True)
+                timers=None, forward_only=True, collect_non_loss_data=True, use_deepspeed=args.deepspeed)
 
     # Move model back to the train mode.
     for model_module in model:

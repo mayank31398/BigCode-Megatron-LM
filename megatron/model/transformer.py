@@ -24,6 +24,8 @@ from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu, get
 
 from .glu_activations import GLU_ACTIVATIONS
 
+import deepspeed
+
 # flags required to enable jit fusion kernels
 torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
@@ -676,6 +678,11 @@ class ParallelAttention(MegatronModule):
             skip_bias_add=True,
             **_args_to_kwargs())
 
+        if deepspeed.checkpointing.is_configured():
+            global get_cuda_rng_tracker, checkpoint
+            get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
+            checkpoint = deepspeed.checkpointing.checkpoint
+
     def _checkpointed_attention_forward(self, query_layer, key_layer,
                                         value_layer, attention_mask, alibi, rotary_pos_emb=None):
         """Forward method with activation checkpointing."""
@@ -707,7 +714,6 @@ class ParallelAttention(MegatronModule):
             self.hidden_size_per_attention_head,
             dtype=self.params_dtype,
             device=torch.cuda.current_device())
-
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, inference_params=None, alibi=None, rotary_pos_emb=None):
@@ -1717,6 +1723,11 @@ class ParallelTransformer(MegatronModule):
                 no_persist_layer_norm=args.no_persist_layer_norm,
                 sequence_parallel=args.sequence_parallel,
                 apply_layernorm_1p=args.apply_layernorm_1p)
+
+        if deepspeed.checkpointing.is_configured():
+            global get_cuda_rng_tracker, checkpoint
+            get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
+            checkpoint = deepspeed.checkpointing.checkpoint
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]

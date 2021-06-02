@@ -36,12 +36,14 @@ from .utils import (
     split_tensor_along_last_dim,
     VocabUtility,
 )
+import deepspeed.runtime.activation_checkpointing.checkpointing as ds_checkpointing
 
 _grad_accum_fusion_available = True
 try:
     import fused_weight_gradient_mlp_cuda
 except ImportError:
     _grad_accum_fusion_available = False
+
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {'tensor_model_parallel': False,
                                       'partition_dim': -1,
@@ -88,6 +90,10 @@ def _initialize_affine_weight_gpu(weight, init_method,
                                          is_parallel=True,
                                          dim=partition_dim,
                                          stride=stride)
+
+    if ds_checkpointing.is_configured():
+        global get_cuda_rng_tracker
+        get_cuda_rng_tracker = ds_checkpointing.get_cuda_rng_tracker
 
     with get_cuda_rng_tracker().fork():
         init_method(weight)
