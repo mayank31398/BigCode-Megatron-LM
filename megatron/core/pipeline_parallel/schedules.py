@@ -261,6 +261,9 @@ def backward_step(grad_scaler, input_tensor, output_tensor,
     # needs to be modified slightly to support arbitrary numbers of skip
     # connections.
 
+    if use_deepspeed:
+        assert model is not None
+
     if timers is not None:
         timers('backward-compute', log_level=2).start()
 
