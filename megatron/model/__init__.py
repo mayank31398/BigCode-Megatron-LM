@@ -16,7 +16,7 @@
 
 from .distributed import DistributedDataParallel
 from .bert_model import BertModel
-from .gpt_model import GPTModel
+from .gpt_model import GPTModel, GPTModelPipe
 from .t5_model import T5Model
 from .language_model import get_language_model
 from .module import Float16Module

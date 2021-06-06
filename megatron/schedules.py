@@ -155,7 +155,7 @@ def forward_step(forward_step_func,
     return [output_tensor]
 
 
-def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad, model):
+def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad, model=None):
     """Backward step through passed-in output tensor.
 
     If last stage, output_tensor_grad is None, otherwise gradient of loss
@@ -168,6 +168,9 @@ def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad, mo
     # needs to be modified slightly to support arbitrary numbers of skip
     # connections.
     args = get_args()
+
+    if args.deepspeed:
+        assert model is not None
 
     timers = get_timers()
     timers('backward-compute').start()
