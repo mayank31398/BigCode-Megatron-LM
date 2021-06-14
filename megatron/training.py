@@ -60,6 +60,7 @@ from megatron.data.dataset_utils import analyze_data_prefix
 from megatron.utils import report_memory, flops_calculator
 
 import deepspeed
+from deepspeed.env_report import main as ds_report
 
 
 def print_datetime(string):
@@ -125,6 +126,9 @@ def pretrain(train_valid_test_dataset_provider,
 
     args = get_args()
     timers = get_timers()
+
+    if torch.distributed.get_rank() == 0:
+        ds_report()
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup').start()
