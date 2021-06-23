@@ -80,7 +80,7 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         # Pytorch distributed.
         _initialize_distributed()
         _configure_logging()
-        
+
         # Random seeds for reproducibility.
         if args.rank == 0:
             print('> setting random seeds to {} ...'.format(args.seed))
