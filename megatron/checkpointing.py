@@ -181,7 +181,7 @@ def read_metadata(tracker_filename):
             print('WARNING: on rank {} found iteration {} in the '
                   'metadata while max iteration across the ranks '
                   'is {}, replacing it with max iteration.'.format(
-                      rank, iteration, max_iter), flush=True)
+                  torch.distributed.get_rank(), iteration, max_iter), flush=True)
     else:
         # When loading a checkpoint outside of training (for example,
         # when editing it), we might not have torch distributed
@@ -220,14 +220,37 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     """Save a model checkpoint."""
     args = get_args()
 
-    # Only rank zero of the data parallel writes to the disk.
-    model = unwrap_model(model)
-
     print_rank_0('saving checkpoint at iteration {:7d} to {}'.format(
         iteration, args.save))
 
     # Collect rng state across data parallel ranks.
     rng_state = get_rng_state()
+
+    if args.deepspeed:
+        _save_deepspeed_checkpoint(iteration, model, rng_state)
+    else:
+        _save_megatron_checkpoint(iteration, model, optimizer, opt_param_scheduler, rng_state)
+
+    print_rank_0('  successfully saved checkpoint at iteration {:7d} to {}' \
+                 .format(iteration, args.save))
+
+    # And update the latest iteration
+    if not torch.distributed.is_initialized() \
+       or torch.distributed.get_rank() == 0:
+        tracker_filename = get_checkpoint_tracker_filename(args.save)
+        with open(tracker_filename, 'w') as f:
+            f.write(str(iteration))
+
+    # Wait so everyone is done (not necessary)
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
+def _save_megatron_checkpoint(iteration, model, optimizer, opt_param_scheduler, rng_state):
+    args = get_args()
+
+    # Only rank zero of the data parallel writes to the disk.
+    model = unwrap_model(model)
 
     # Checkpoint name.
     checkpoint_name = get_checkpoint_name(args.save, iteration)
@@ -276,19 +299,28 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    print_rank_0('  successfully saved checkpoint at iteration {:7d} to {}' \
-                 .format(iteration, args.save))
 
-    # And update the latest iteration
-    if not torch.distributed.is_initialized() \
-       or torch.distributed.get_rank() == 0:
-        tracker_filename = get_checkpoint_tracker_filename(args.save)
-        with open(tracker_filename, 'w') as f:
-            f.write(str(iteration))
+def _save_deepspeed_checkpoint(iteration, model, rng_state):
+    args = get_args()
 
-    # Wait so everyone is done (not necessary)
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+    # Checkpoint file names.
+    checkpoint_name = get_checkpoint_name(args.save, iteration)
+    # Trim off the filename and mp_rank_* directory.
+    for _ in range(3):
+        checkpoint_name = os.path.dirname(checkpoint_name)
+
+    # Arguments, iteration, and model.
+    state_dict = {
+        "args": args,
+        "checkpoint_version": 3.0,
+        "iteration": iteration,
+    }
+    # RNG states.
+    if not args.no_save_rng:
+        state_dict["rng_state"] = rng_state
+
+    # Saving is a collective communication
+    model[0].save_checkpoint(checkpoint_name, client_state=state_dict)
 
 
 def _transpose_first_dim(t, num_splits, num_splits_first, model):
@@ -497,12 +529,102 @@ def load_args_from_checkpoint(args, load_arg='load'):
     return args, checkpoint_args
 
 
+def _set_rng_state(state_dict, model_checkpoint_name, data_parallel_random_init):
+    try:
+        if 'rng_state' in state_dict:
+            # access rng_state for data parallel rank
+            if data_parallel_random_init:
+                rng_state = state_dict['rng_state'][mpu.get_data_parallel_rank()]
+            else:
+                rng_state = state_dict['rng_state'][0]
+
+            random.setstate(rng_state['random_rng_state'])
+            np.random.set_state(rng_state['np_rng_state'])
+            torch.set_rng_state(rng_state['torch_rng_state'])
+            torch.cuda.set_rng_state(rng_state['cuda_rng_state'])
+
+            # Check for empty states array
+            if not rng_state['rng_tracker_states']:
+                raise KeyError
+            tensor_parallel.get_cuda_rng_tracker().set_states(
+                rng_state['rng_tracker_states'])
+        else:  # backward compatability
+            random.setstate(state_dict['random_rng_state'])
+            np.random.set_state(state_dict['np_rng_state'])
+            torch.set_rng_state(state_dict['torch_rng_state'])
+            torch.cuda.set_rng_state(state_dict['cuda_rng_state'])
+
+            # Check for empty states array
+            if not state_dict['rng_tracker_states']:
+                raise KeyError
+            tensor_parallel.get_cuda_rng_tracker().set_states(
+                state_dict['rng_tracker_states'])
+    except KeyError:
+        print_rank_0('Unable to load rng state from checkpoint {}. '
+                        'Specify --no-load-rng or --finetune to prevent '
+                        'attempting to load the rng state, '
+                        'exiting ...'.format(model_checkpoint_name))
+        sys.exit()
+
+
+def _get_iteration_from_state_dict(release, finetune, state_dict):
+    if finetune or release:
+        return 0
+    else:
+        try:
+            return state_dict['iteration']
+        except KeyError:
+            try:  # Backward compatible with older checkpoints
+                return state_dict['total_iters']
+            except KeyError:
+                print_rank_0('A metadata file exists but unable to load '
+                             'iteration from checkpoint, exiting')
+                sys.exit()
+
+
+def _set_consumed_samples(state_dict):
+    args = get_args()
+
+    assert args.consumed_train_samples == 0
+    assert args.consumed_valid_samples == 0
+
+    if 'args' in state_dict and not args.finetune:
+        checkpoint_args = state_dict['args']
+        check_checkpoint_args(checkpoint_args)
+
+        args.consumed_train_samples = getattr(checkpoint_args,
+                                              'consumed_train_samples', 0)
+        update_num_microbatches(consumed_samples=args.consumed_train_samples)
+        args.consumed_valid_samples = getattr(checkpoint_args,
+                                              'consumed_valid_samples', 0)
+    else:
+        print_rank_0('could not find arguments in the checkpoint ...')
+
+
 def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', strict=True, iteration=None):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
         parameters and buffers in model.
     """
+    args = get_args()
+
+    if args.deepspeed:
+        iteration = _load_deepspeed_checkpoint(model, iteration=iteration)
+    else:
+        iteration = _load_megatron_checkpoint(model, optimizer, opt_param_scheduler, strict=strict, iteration=iteration)
+
+    # Some utilities want to load a checkpoint without distributed being initialized
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+    print_rank_0(f'  successfully loaded checkpoint from {getattr(args, load_arg)} '
+                 f'at iteration {iteration}')
+
+    return iteration
+
+
+def _load_megatron_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', strict=True, iteration=None):
     args = get_args()
     load_dir = getattr(args, load_arg)
 
@@ -526,33 +648,10 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
 
     # Set iteration.
-    if args.finetune or release:
-        iteration = 0
-    else:
-        try:
-            iteration = state_dict['iteration']
-        except KeyError:
-            try:  # Backward compatible with older checkpoints
-                iteration = state_dict['total_iters']
-            except KeyError:
-                print_rank_0('A metadata file exists but unable to load '
-                             'iteration from checkpoint {}, exiting'.format(
-                                 model_checkpoint_name))
-                sys.exit()
+    iteration = _get_iteration_from_state_dict(release, args.finetune, state_dict)
 
     # Check arguments.
-    assert args.consumed_train_samples == 0
-    assert args.consumed_valid_samples == 0
-    if 'args' in state_dict and not args.finetune:
-        checkpoint_args = state_dict['args']
-        check_checkpoint_args(checkpoint_args)
-        args.consumed_train_samples = getattr(checkpoint_args,
-                                              'consumed_train_samples', 0)
-        update_num_microbatches(consumed_samples=args.consumed_train_samples)
-        args.consumed_valid_samples = getattr(checkpoint_args,
-                                              'consumed_valid_samples', 0)
-    else:
-        print_rank_0('could not find arguments in the checkpoint ...')
+    _set_consumed_samples(state_dict)
 
     # Model.
     if len(model) == 1:
@@ -603,46 +702,45 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
     # rng states.
     if not release and not args.finetune and not args.no_load_rng:
-        try:
-            if 'rng_state' in state_dict:
-                # access rng_state for data parallel rank
-                if args.data_parallel_random_init:
+        _set_rng_state(state_dict, model_checkpoint_name, args.data_parallel_random_init)
 
-                    rng_state = state_dict['rng_state'][mpu.get_data_parallel_rank()]
-                else:
-                    rng_state = state_dict['rng_state'][0]
-                random.setstate(rng_state['random_rng_state'])
-                np.random.set_state(rng_state['np_rng_state'])
-                torch.set_rng_state(rng_state['torch_rng_state'])
-                torch.cuda.set_rng_state(rng_state['cuda_rng_state'])
-                # Check for empty states array
-                if not rng_state['rng_tracker_states']:
-                    raise KeyError
-                tensor_parallel.get_cuda_rng_tracker().set_states(
-                    rng_state['rng_tracker_states'])
-            else:  # backward compatability
-                random.setstate(state_dict['random_rng_state'])
-                np.random.set_state(state_dict['np_rng_state'])
-                torch.set_rng_state(state_dict['torch_rng_state'])
-                torch.cuda.set_rng_state(state_dict['cuda_rng_state'])
-                # Check for empty states array
-                if not state_dict['rng_tracker_states']:
-                    raise KeyError
-                tensor_parallel.get_cuda_rng_tracker().set_states(
-                    state_dict['rng_tracker_states'])
-        except KeyError:
-            print_rank_0('Unable to load rng state from checkpoint {}. '
-                         'Specify --no-load-rng or --finetune to prevent '
-                         'attempting to load the rng state, '
-                         'exiting ...'.format(model_checkpoint_name))
-            sys.exit()
+    return iteration
 
-    # Some utilities want to load a checkpoint without distributed being initialized
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
 
-    print_rank_0(f'  successfully loaded checkpoint from {load_dir} '
-                 f'at iteration {iteration}')
+def _load_deepspeed_checkpoint(model, load_arg='load', iteration=None):
+    args = get_args()
+    load_dir = getattr(args, load_arg)
+
+    loaded_dir, state_dict = model[0].load_checkpoint(
+        load_dir,
+        tag=None if iteration is None else f"global_step{iteration}"
+    )
+
+    if loaded_dir is None:
+        print_rank_0('WARNING: could not find the metadata file {} '.format(
+            args.load))
+        print_rank_0('    will not load any checkpoints and will start from '
+                    'random')
+        return 0
+    release = False
+
+    # set checkpoint version
+    set_checkpoint_version(state_dict.get('checkpoint_version', 0))
+
+    # Set iteration.
+    iteration = _get_iteration_from_state_dict(release, args.finetune, state_dict)
+
+    # Check arguments.
+    _set_consumed_samples(state_dict)
+
+    # Fix up query/key/value matrix ordering if needed
+    checkpoint_version = get_checkpoint_version()
+    print_rank_0(f' checkpoint version {checkpoint_version}')
+    fix_query_key_value_ordering(model, checkpoint_version)
+
+    # rng states.
+    if not release and not args.finetune and not args.no_load_rng:
+        _set_rng_state(state_dict)
 
     return iteration
 
