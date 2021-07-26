@@ -1527,7 +1527,25 @@ def _get_layer_type(model_type, default_layer_type, retro_layer_numbers,
 
 
 class ParallelTransformerLayerPipe(ParallelTransformerLayer):
-    """Extends ParallelTransformerLayer to forward attention_mask through the pipeline. """
+    """Extends ParallelTransformerLayer to forward attention_mask through the pipeline.
+
+    Forward has two usages that affect attention mask communication:
+
+    1) forward((input, attn_mask) , **kwargs) -> (output, mask)
+       When the attention mask is provided as the second positional
+       argument, typical pipeline behavior is used and both the output
+       *and* mask are returned in a tuple. This tuple is then forwarded
+       to the next stage in the pipeline.
+
+       This version is useful if masks are dynamic.
+    
+    2) forward(input, **kwargs) -> output
+       When the mask is static over all samples, it is advantageous to
+       cache the mask and avoid communicating it.
+
+       If no mask is provided, the module will query `self._args.attn_mask`
+       for the mask and only return `super().forward(...)`
+    """
     def forward(self, inputs, **kwargs):
         assert torch.is_tensor(inputs) or isinstance(inputs, tuple)
         if torch.is_tensor(inputs) or len(inputs) == 1:
