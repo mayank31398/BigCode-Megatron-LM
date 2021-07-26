@@ -451,7 +451,7 @@ def train_step(forward_step_func, data_iterator,
         skipped_iter = 0
         grad_norm = 0.
         num_zeros_in_grad = 0
-        return {'lm-loss' : loss}, skipped_iter, grad_norm, num_zeros_in_grad
+        return {'lm loss' : loss}, skipped_iter, grad_norm, num_zeros_in_grad
 
     # Set grad to zero.
     if not args.deepspeed:
@@ -502,6 +502,7 @@ def train_step(forward_step_func, data_iterator,
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if args.deepspeed:
         model[0].step(lr_kwargs={'increment': increment})
+        update_successful = model[0].was_step_applied()
     else:
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
     timers('optimizer').stop()
@@ -800,7 +801,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         # Logging.
         if args.deepspeed:
-            loss_scale = -1
+            loss_scale = model[0].optimizer.cur_scale
         else:
             loss_scale = optimizer.get_loss_scale().item()
         params_norm = None
@@ -900,17 +901,24 @@ def evaluate(forward_step_func,
                                                             args.eval_iters))
 
             forward_backward_func = get_forward_backward_func()
-            loss_dicts = forward_backward_func(
-                forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
-                model=model,
-                num_microbatches=get_num_microbatches(),
-                dtype=args.params_dtype,
-                tensor_shape=(args.seq_length, args.micro_batch_size, args.hidden_size),
-                sequence_parallel=args.sequence_parallel,
-                forward_only=True,
-                timers=None,
-                use_deepspeed=args.deepspeed)
+
+            if args.deepspeed and mpu.get_pipeline_model_parallel_world_size() > 1:
+                # DeepSpeed uses eval_batch() and already aggregates losses.
+                assert isinstance(model, list) and len(model) == 1
+                loss = model[0].eval_batch(data_iterator)
+                loss_dicts = [{'lm loss' : loss}] * get_num_microbatches()
+            else:
+                loss_dicts = forward_backward_func(
+                    forward_step_func=forward_step_func,
+                    data_iterator=data_iterator,
+                    model=model,
+                    num_microbatches=get_num_microbatches(),
+                    dtype=args.params_dtype,
+                    tensor_shape=(args.seq_length, args.micro_batch_size, args.hidden_size),
+                    sequence_parallel=args.sequence_parallel,
+                    forward_only=True,
+                    timers=None,
+                    use_deepspeed=args.deepspeed)
 
             # Empty unused memory
             if args.empty_unused_memory_level >= 1:
