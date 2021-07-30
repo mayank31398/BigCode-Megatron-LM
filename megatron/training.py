@@ -398,7 +398,6 @@ def setup_model_and_optimizer(model_provider_func,
             optimizer=optimizer,
             args=args,
             lr_scheduler=opt_param_scheduler,
-            mpu=mpu if pp == 1 else None,
         )
         if isinstance(model, deepspeed.PipelineEngine):
             # hack to get batch_fn from pretrain_gpt.py
@@ -443,7 +442,7 @@ def train_step(forward_step_func, data_iterator,
     args = get_args()
     timers = get_timers()
 
-    if args.deepspeed and mpu.get_pipeline_model_parallel_world_size() > 1:
+    if args.deepspeed:
         assert isinstance(model[0], deepspeed.PipelineEngine), model
         loss = model[0].train_batch(data_iter=data_iterator)
         skipped_iter = 0
@@ -770,6 +769,15 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     while iteration < args.train_iters:
         update_num_microbatches(args.consumed_train_samples)
         args.curr_iteration = iteration
+
+        if args.deepspeed:
+            # inform deepspeed of any batch size changes
+            global_batch_size = mpu.get_data_parallel_world_size() * \
+                                args.micro_batch_size * \
+                                get_num_microbatches()
+            model[0].set_train_batch_size(global_batch_size)
+
+
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
                        train_data_iterator,
@@ -884,7 +892,7 @@ def evaluate(forward_step_func,
 
             forward_backward_func = get_forward_backward_func()
 
-            if args.deepspeed and mpu.get_pipeline_model_parallel_world_size() > 1:
+            if args.deepspeed:
                 # DeepSpeed uses eval_batch() and already aggregates losses.
                 assert isinstance(model, list) and len(model) == 1
                 loss = model[0].eval_batch(data_iterator)
