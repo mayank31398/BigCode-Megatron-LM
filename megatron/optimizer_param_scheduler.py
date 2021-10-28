@@ -17,13 +17,13 @@
 
 import math
 
-from megatron import print_rank_0
+from megatron import print_rank_0, get_args
 
 class OptimizerParamScheduler(object):
     """Anneals learning rate and weight decay"""
 
     def __init__(self, optimizer, max_lr, min_lr,
-                 lr_warmup_steps, lr_decay_steps, lr_decay_style,
+                 lr_warmup_steps, lr_decay_steps, lr_decay_tokens, lr_decay_style,
                  start_wd, end_wd, wd_incr_steps, wd_incr_style,
                  use_checkpoint_opt_param_scheduler=True,
                  override_opt_param_scheduler=False):
@@ -41,6 +41,10 @@ class OptimizerParamScheduler(object):
         self.lr_decay_steps = lr_decay_steps
         assert self.lr_decay_steps > 0
         assert self.lr_warmup_steps < self.lr_decay_steps
+
+        self.lr_decay_tokens = lr_decay_tokens
+        self.num_tokens = 0
+        self.lr_warmup_tokens = 0
 
         self.lr_decay_style = lr_decay_style
 
@@ -71,6 +75,8 @@ class OptimizerParamScheduler(object):
             assert self.start_wd == self.end_wd
             return self.end_wd
 
+        assert get_args().train_tokens is None
+
         incr_ratio = float(self.num_steps) / float(self.wd_incr_steps)
         assert incr_ratio >= 0.0
         assert incr_ratio <= 1.0
@@ -93,6 +99,8 @@ class OptimizerParamScheduler(object):
 
         # Use linear warmup for the initial part.
         if self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps:
+            if self.num_steps == self.lr_warmup_steps and self.lr_decay_tokens is not None:
+                self.lr_warmup_tokens = self.num_tokens
             return self.max_lr * float(self.num_steps) / \
                 float(self.lr_warmup_steps)
 
@@ -100,14 +108,27 @@ class OptimizerParamScheduler(object):
         if self.lr_decay_style == 'constant':
             return self.max_lr
 
-        # For any steps larger than `self.lr_decay_steps`, use `self.min_lr`.
-        if self.num_steps > self.lr_decay_steps:
-            return self.min_lr
-        
-        # If we are done with the warmup period, use the decay style.
-        num_steps_ = self.num_steps - self.lr_warmup_steps
-        decay_steps_ = self.lr_decay_steps - self.lr_warmup_steps
-        decay_ratio = float(num_steps_) / float(decay_steps_)
+        if self.lr_decay_tokens is None:
+            # step-based decay
+
+            # For any steps larger than `self.lr_decay_steps`, use `self.min_lr`.
+            if self.num_steps > self.lr_decay_steps:
+                return self.min_lr
+
+            # If we are done with the warmup period, use the decay style.
+            num_steps_ = self.num_steps - self.lr_warmup_steps
+            decay_steps_ = self.lr_decay_steps - self.lr_warmup_steps
+            decay_ratio = float(num_steps_) / float(decay_steps_)
+        else:
+            # token-based decay
+
+            if self.num_tokens > self.decay_tokens:
+                return self.min_lr
+
+            num_tokens_ = self.num_tokens - self.lr_warmup_tokens
+            decay_tokens_ = self.lr_decay_tokens - self.lr_warmup_tokens
+            decay_ratio = float(num_tokens_) / float(decay_tokens_)
+
         assert decay_ratio >= 0.0
         assert decay_ratio <= 1.0
         delta_lr = self.max_lr - self.min_lr
@@ -123,8 +144,12 @@ class OptimizerParamScheduler(object):
         return self.min_lr + coeff * delta_lr
 
 
-    def step(self, increment):
+    def step(self, increment, token_num=None):
         """Set lr for all parameters groups."""
+        if token_num is None:
+            args = get_args()
+            token_num = args.consumed_train_tokens
+        self.num_tokens = token_num
         self.num_steps += increment
         new_lr = self.get_lr()
         new_wd = self.get_wd()
@@ -137,7 +162,9 @@ class OptimizerParamScheduler(object):
         state_dict = {
             'max_lr': self.max_lr,
             'lr_warmup_steps': self.lr_warmup_steps,
+            'lr_warmup_tokens': self.lr_warmup_tokens,
             'num_steps': self.num_steps,
+            'num_tokens': self.num_tokens,
             'lr_decay_style': self.lr_decay_style,
             'lr_decay_steps': self.lr_decay_steps,
             'min_lr': self.min_lr,
@@ -166,17 +193,24 @@ class OptimizerParamScheduler(object):
 
 
     def load_state_dict(self, sd):
-
+        # max_lr
         if 'start_lr' in sd:
             max_lr_ = sd['start_lr']
         else:
             max_lr_ = sd['max_lr']
         self.max_lr = self._check_and_set(self.max_lr, max_lr_,
                                           'learning rate')
-        
+
+        # min_lr
         self.min_lr = self._check_and_set(self.min_lr, sd['min_lr'],
                                           'minimum learning rate')
 
+        # num_tokens
+        if 'num_tokens' in sd:
+            self.num_tokens = sd['num_tokens']
+        self.step(num_steps, self.num_tokens)
+
+        # lr_warmup_steps
         if 'warmup_iter' in sd:
             lr_warmup_steps_ = sd['warmup_iter']
         elif 'warmup_steps' in sd:
@@ -187,6 +221,11 @@ class OptimizerParamScheduler(object):
                                                 lr_warmup_steps_,
                                                 'warmup iterations')
 
+        # lr_warmup_tokens
+        if 'lr_warmup_tokens' in sd:
+            self.lr_warmup_tokens = sd['lr_warmup_tokens']
+
+        # lr_decay_steps
         if 'end_iter' in sd:
             lr_decay_steps_ = sd['end_iter']
         elif 'decay_steps' in sd:
@@ -196,6 +235,7 @@ class OptimizerParamScheduler(object):
         self.lr_decay_steps = self._check_and_set(self.lr_decay_steps, lr_decay_steps_,
                                                'total number of iterations')
 
+        # lr_decay_style
         if 'decay_style' in sd:
             lr_decay_style_ = sd['decay_style']
         else:
@@ -204,6 +244,7 @@ class OptimizerParamScheduler(object):
                                                lr_decay_style_,
                                                'learning rate decay style')
 
+        # num_steps
         if 'num_iters' in sd:
             num_steps = sd['num_iters']
         else:
@@ -212,23 +253,19 @@ class OptimizerParamScheduler(object):
 
 
         if 'start_wd' in sd:
+            # start_wd
             self.start_wd = self._check_and_set(self.start_wd,
                                                 sd['start_wd'],
                                                 "start weight decay")
+            # end_wd
             self.end_wd = self._check_and_set(self.end_wd,
                                                 sd['end_wd'],
                                                 "end weight decay")
+            # wd_incr_steps
             self.wd_incr_steps = self._check_and_set(self.wd_incr_steps,
                                                 sd['wd_incr_steps'],
                                                 "total number of weight decay iterations")
+            # wd_incr_style
             self.wd_incr_style = self._check_and_set(self.wd_incr_style,
                                                 sd['wd_incr_style'],
                                                 "weight decay incr style")
-            
-
-
-
-
-
-
-

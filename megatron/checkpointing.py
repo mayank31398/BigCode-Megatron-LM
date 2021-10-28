@@ -610,6 +610,7 @@ def _set_consumed_samples(model_state_dict):
 
     assert args.consumed_train_samples == 0
     assert args.consumed_valid_samples == 0
+    assert args.consumed_train_tokens == 0
 
     if 'args' in model_state_dict:
         checkpoint_args = model_state_dict['args']
@@ -620,6 +621,7 @@ def _set_consumed_samples(model_state_dict):
             update_num_microbatches(consumed_samples=args.consumed_train_samples)
             args.consumed_valid_samples = getattr(checkpoint_args,
                                                 'consumed_valid_samples', 0)
+            args.consumed_train_tokens = getattr(checkpoint_args, "consumed_train_tokens", 0)
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
 

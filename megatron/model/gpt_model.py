@@ -95,7 +95,19 @@ class GPTModel(MegatronModule):
         self.language_model.set_input_tensor(input_tensor)
 
     def forward(self, input_ids, position_ids, attention_mask, labels=None,
-                tokentype_ids=None, inference_params=None):
+                tokentype_ids=None, inference_params=None, curriculum_seqlen=None):
+        if curriculum_seqlen is not None:
+            args = get_args()
+            args.curriculum_seqlen = curriculum_seqlen
+            if curriculum_seqlen < input_ids.size()[1]:
+                # seqlen-based curriculum learning
+                # input_ids, position_ids, labels have size [batch size, seqlen]
+                input_ids = input_ids[:, :curriculum_seqlen].contiguous()
+                position_ids = position_ids[:, :curriculum_seqlen].contiguous()
+                labels = labels[:, :curriculum_seqlen].contiguous()
+
+                # attention_mask has size [1, 1, seqlen, seqlen]
+                attention_mask = attention_mask[:, :, :curriculum_seqlen, :curriculum_seqlen].contiguous()
 
         lm_output = self.language_model(
             input_ids,
