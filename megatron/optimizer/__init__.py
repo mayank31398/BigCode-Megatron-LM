@@ -1,8 +1,4 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
-
-from apex.optimizers import FusedAdam as Adam
-from apex.optimizers import FusedSGD as SGD
-
 from megatron import get_args
 
 from .distrib_optimizer import DistributedOptimizer
@@ -66,29 +62,44 @@ def get_megatron_optimizer(model,
                            lr_mult=1.0):
     args = get_args()
 
-    if args.cpu_optimizer:
-        raise NotImplementedError('need to add cpu adam')
-
     # Base optimizer.
     param_groups = get_param_groups(model,
                                     no_weight_decay_cond,
                                     scale_lr_cond,
                                     lr_mult)
+    
+    if args.cpu_optimizer:
+        assert args.optimizer == 'adam', 'CPU offloading is for Adam'
 
-    if args.optimizer == 'adam':
-        optimizer = Adam(param_groups,
-                         lr=args.lr,
-                         weight_decay=args.weight_decay,
-                         betas=(args.adam_beta1, args.adam_beta2),
-                         eps=args.adam_eps)
-    elif args.optimizer == 'sgd':
-        optimizer = SGD(param_groups,
-                        lr=args.lr,
-                        weight_decay=args.weight_decay,
-                        momentum=args.sgd_momentum)
+        if args.cpu_torch_adam:
+            from torch.optim import AdamW as cpu_adam_optimizer
+        else:
+            from deepspeed.ops.adam import DeepSpeedCPUAdam as cpu_adam_optimizer
+
+        optimizer = cpu_adam_optimizer(param_groups,
+                                       lr=args.lr,
+                                       weight_decay=args.weight_decay,
+                                       betas=(args.adam_beta1, args.adam_beta2),
+                                       eps=args.adam_eps)
     else:
-        raise Exception('{} optimizer is not supported.'.format(
-            args.optimizer))
+        if args.optimizer == 'adam':
+            from apex.optimizers import FusedAdam as Adam
+
+            optimizer = Adam(param_groups,
+                             lr=args.lr,
+                             weight_decay=args.weight_decay,
+                             betas=(args.adam_beta1, args.adam_beta2),
+                             eps=args.adam_eps)
+        elif args.optimizer == 'sgd':
+            from apex.optimizers import FusedSGD as SGD
+
+            optimizer = SGD(param_groups,
+                            lr=args.lr,
+                            weight_decay=args.weight_decay,
+                            momentum=args.sgd_momentum)
+        else:
+            raise Exception('{} optimizer is not supported.'.format(
+                args.optimizer))
 
     if args.deepspeed:
         return optimizer
