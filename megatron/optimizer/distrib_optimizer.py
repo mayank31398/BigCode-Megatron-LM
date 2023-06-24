@@ -451,11 +451,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
     def state_dict(self):
         """
+        The state dict must contain the fp32-from-float16 shards.
+        """
+        state_dict = {}
+        state_dict['optimizer'] = self.optimizer.state_dict()
+        if self.grad_scaler:
+            state_dict['grad_scaler'] = self.grad_scaler.state_dict()
+        state_dict['shard_fp32_from_float16_groups'] = \
+            self.shard_fp32_from_float16_groups
+        return state_dict
+
+
+    def state_dict_without_params(self):
+        """
         The state dict contains all non-DP-rank-dependent (i.e., non-parameter-
         related) optimizer variables. The returned state dict can be stored in
         the standard model/RNG checkpoint file. The parameter and dependent
         optimizer state (e.g., exp_avg, exp_avg_sq) are stored in a separate
-        checkpoint file by calling 'save_parameter_state()'.
+        checkpoint file by calling 'save_unsharded_parameter_state()'.
         """
 
         state_dict = {}
@@ -477,6 +490,39 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
 
     def load_state_dict(self, state_dict):
+        """
+        Load the state dict.
+        """
+
+        # Optimizer.
+        optimizer_key = 'optimizer'
+        if optimizer_key not in state_dict:
+            optimizer_key = 'optimizer_state_dict'
+            print_rank_0('***WARNING*** loading optimizer from '
+                         'an old checkpoint ...')
+        self.optimizer.load_state_dict(state_dict[optimizer_key])
+
+        # Grad scaler.
+        if 'grad_scaler' not in state_dict:
+            print_rank_0('***WARNING*** found an old checkpoint, will not '
+                         'load grad scaler ...')
+        else:
+            if self.grad_scaler:
+                self.grad_scaler.load_state_dict(state_dict['grad_scaler'])
+            else:
+                print_rank_0('***WARNING*** fould the grad scaler in the '
+                             'checkpoint but it is None in the class. '
+                             'Skipping loading grad scaler ...')
+
+        # Copy data for the main params.
+        for current_group, saved_group in zip(
+                self.shard_fp32_from_float16_groups,
+                state_dict["shard_fp32_from_float16_groups"]):
+            for current_param, saved_param in zip(current_group, saved_group):
+                current_param.data.copy_(saved_param.data)
+
+
+    def load_state_dict_without_params(self, state_dict):
         """Load the state dict.
 
         As detailed in state_dict(), the state dict contains all non-
@@ -488,10 +534,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         any tensor dimension information, so we must get these dimensions from
         the DP shards mapped during DistributedOptimizer.__init__().
 
-        The tensor parameter state is loaded via load_parameter_state(), and
+        The tensor parameter state is loaded via load_unsharded_parameter_state(), and
         so this method also must populate the loaded state dict with dummy
         tensor data (i.e., via torch.empty() below). This will be overwritten
-        during load_parameter_state().
+        during load_unsharded_parameter_state().
 
         ** Note: Torch optimizer's state structure. **
         The Torch optimizer stores its state in two levels. The top level is a
@@ -518,7 +564,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         } for idx, group in enumerate(state_dict["optimizer"]["param_groups"])]
 
         # Allocate 'dummy' data for optimizer state (i.e., torch.empty() below)
-        # - Real data is overwritten during load_parameter_state().
+        # - Real data is overwritten during load_unsharded_parameter_state().
         state_dict_state = []
         for gbuf_range_maps in self.model_gbuf_ranges:
             for gbuf_range_map in gbuf_range_maps.values():
@@ -568,7 +614,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                              'Skipping loading grad scaler ...')
 
 
-    def save_parameter_state(self, filename):
+    def save_unsharded_parameter_state(self, filename):
         """Save parameter state (i.e., parameter & optimizer tensors).
 
         This method performs three steps:
@@ -661,10 +707,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             torch.save(state, filename)
 
 
-    def load_parameter_state(self, filename):
+    def load_unsharded_parameter_state(self, filename):
         """Load parameter state (i.e., parameter & optimizer tensors).
 
-        This method performs the reverse of save_parameter_state():
+        This method performs the reverse of save_unsharded_parameter_state():
         - Load world buffers from disk (i.e., distrib_opt.pt).
         - Scatter contiguous buffers from DP rank 0 to each DP rank (each DP
           rank receives its relevant subset of the world buffers).
