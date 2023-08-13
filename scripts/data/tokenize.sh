@@ -2,11 +2,11 @@ TOKENIZER_PATH=tokenizer.json
 
 # tokenize dataset
 mkdir -p data
-python tools/preprocess_data.py \
-    --input data_raw/debug/mix_uspto.jsonl \
+python3 tools/preprocess_data.py \
+    --input data.jsonl \
     --output-prefix data/debug \
-    --tokenizer-type HuggingFaceTokenizer \
-    --tokenizer-path $TOKENIZER_PATH \
+    --tokenizer-type TokenizerFromFile \
+    --tokenizer-file $TOKENIZER_PATH \
     --dataset-impl mmap \
     --append-eod \
     --workers 1 \

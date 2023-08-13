@@ -5,11 +5,9 @@ export NCCL_NSOCKS_PERTHREAD=4
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 DISTRIBUTED_ARGS="\
---nproc_per_node $GPUS_PER_NODE \
---nnodes $NNODES \
---node_rank $NODE_RANK \
---master_addr $MASTER_ADDR \
---master_port $MASTER_PORT \
+--nproc_per_node 2 \
+--nnodes 1 \
+--node_rank 0 \
 "
 
 CHECKPOINT_PATH=checkpoints-absolute  # Adjust: Directory to store the checkpoints
@@ -27,25 +25,23 @@ GPT_ARGS="\
 --max-position-embeddings 2048 \
 --attention-dropout 0.1 \
 --hidden-dropout 0.1 \
---micro-batch-size 8 \
---global-batch-size 2048 \
+--micro-batch-size 2 \
+--global-batch-size 32 \
 --lr 0.0003 \
 --min-lr 0.00003 \
---train-iters 300000 \
---lr-decay-iters 300000 \
+--train-iters 30 \
+--lr-decay-iters 30 \
 --lr-decay-style cosine \
---lr-warmup-iters 2000 \
+--lr-warmup-iters 5 \
 --weight-decay .1 \
 --adam-beta2 .95 \
 --clip-grad 1.0 \
 --bf16 \
---use-flash-attn \
 --fim-rate 0 \
 --log-interval 10 \
 --save-interval 2500 \
 --eval-interval 2500 \
 --eval-iters 2 \
---use-distributed-optimizer \
 --valid-num-workers 0 \
 --structured-logs \
 --structured-logs-dir $CHECKPOINT_PATH/logs
@@ -62,9 +58,9 @@ GPT_ARGS="\
 torchrun $DISTRIBUTED_ARGS \
     pretrain_gpt.py \
     $GPT_ARGS \
-    --tokenizer-type HuggingFaceTokenizer \
-    --tokenizer-path $TOKENIZER_PATH \
+    --tokenizer-type TokenizerFromFileWithFIM \
+    --tokenizer-file $TOKENIZER_PATH \
     --save $CHECKPOINT_PATH \
     --load $CHECKPOINT_PATH \
     --data-path data/debug_text_document \
-    --fix-infiniband
+    --no-gradient-accumulation-fusion
