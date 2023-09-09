@@ -557,6 +557,33 @@ class FlashSelfAttention(torch.nn.Module):
         return output
 
 
+class SDPA(torch.nn.Module):
+    """Implement the scaled dot product attention with softmax.
+    Arguments
+    ---------
+        softmax_scale: The temperature to use for the softmax attention.
+                      (default: 1/sqrt(d_keys) where d_keys is computed at
+                      runtime)
+        attention_dropout: The dropout rate to apply to the attention
+                           (default: 0.0)
+    """
+    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0):
+        super().__init__()
+        self.causal = causal
+        self.softmax_scale = softmax_scale
+        self.dropout_p = attention_dropout
+
+    def forward(self, q, k, v):
+        """Implements the multihead softmax attention.
+        Arguments
+        ---------
+            q, k, v: The tensor containing the query, key, and value. (B, S, H, D)
+        """
+
+        return F.scaled_dot_product_attention(q, k, v,dropout_p=self.dropout_p if self.training else 0,
+                                              is_causal=self.causal)
+
+
 class ParallelAttention(MegatronModule):
     """Parallel self-attention layer abstract class.
 
@@ -578,6 +605,7 @@ class ParallelAttention(MegatronModule):
         self.sequence_parallel = args.sequence_parallel
 
         self.use_flash_attn = args.use_flash_attn
+        self.use_sdpa = args.use_sdpa
 
         projection_size = args.kv_channels * args.num_attention_heads
 
@@ -665,6 +693,15 @@ class ParallelAttention(MegatronModule):
             self.core_attention_flash = FlashSelfAttention(
                 causal=True, attention_dropout=args.attention_dropout
             )
+
+        if self.use_sdpa:
+            assert args.position_embedding_type != PositionEmbeddingType.alibi, \
+                ('SDPA does not support alibi positional embeddings yet')
+            
+            if self.checkpoint_core_attention:
+                print_rank_0("  Warning, using selective recomputation with flash-attn: this is already handled in "
+                             "SDPA and has no effect.")
+            self.core_attention_flash = SDPA(causal=True, attention_dropout=args.attention_dropout)
 
         # Output.
         self.dense = tensor_parallel.RowParallelLinear(
@@ -892,7 +929,22 @@ class ParallelAttention(MegatronModule):
                 with tensor_parallel.get_cuda_rng_tracker().fork():
                     context_layer = self.core_attention_flash(q, k, v)
             context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
+        elif self.use_sdpa:
+            assert self.attention_head_type == "multiquery"
 
+            sq, b, np, hn = query_layer.size()
+            # Expand kv to be compatible with flash-attn implementation
+            # [sq, b, 1, hn] -> [sq, b, np, hn]
+            key_layer = key_layer.expand((sq, b, np, hn))
+            value_layer = value_layer.expand((sq, b, np, hn))
+            q, k, v = [rearrange(x, 's b h d -> h b s d').contiguous()
+                       for x in (query_layer, key_layer, value_layer)]
+            if self.sequence_parallel:
+                context_layer = self.core_attention_flash(q, k, v)
+            else:
+                with tensor_parallel.get_cuda_rng_tracker().fork():
+                    context_layer = self.core_attention_flash(q, k, v)
+            context_layer = rearrange(context_layer, 'h b s d -> s b (h d)').contiguous()
         else:
             if self.checkpoint_core_attention:
                 context_layer = self._checkpointed_attention_forward(
