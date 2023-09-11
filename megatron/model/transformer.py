@@ -697,6 +697,8 @@ class ParallelAttention(MegatronModule):
         if self.use_sdpa:
             assert args.position_embedding_type != PositionEmbeddingType.alibi, \
                 ('SDPA does not support alibi positional embeddings yet')
+            if rearrange is None:
+                raise ImportError('einops is not installed, please install with pip install einops')
             
             if self.checkpoint_core_attention:
                 print_rank_0("  Warning, using selective recomputation with flash-attn: this is already handled in "
