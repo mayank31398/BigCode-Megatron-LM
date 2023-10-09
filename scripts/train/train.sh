@@ -11,7 +11,7 @@ DISTRIBUTED_ARGS="\
 "
 
 CHECKPOINT_PATH=checkpoints-absolute  # Adjust: Directory to store the checkpoints
-TOKENIZER_PATH=tokenizer.json  # Adjust
+TOKENIZER_PATH=../Granite-Megatron-LM/tokenizers/starcoder/tokenizer.json  # Adjust
 
 GPT_ARGS="\
 --tensor-model-parallel-size 2 \
@@ -21,16 +21,16 @@ GPT_ARGS="\
 --num-attention-heads 32 \
 --attention-head-type multiquery \
 --init-method-std 0.01275 \
---seq-length 2048 \
---max-position-embeddings 2048 \
+--seq-length 1024 \
+--max-position-embeddings 1024 \
 --attention-dropout 0.1 \
 --hidden-dropout 0.1 \
---micro-batch-size 2 \
---global-batch-size 32 \
+--micro-batch-size 1 \
+--global-batch-size 4 \
 --lr 0.0003 \
 --min-lr 0.00003 \
---train-iters 30 \
---lr-decay-iters 30 \
+--train-iters 10 \
+--lr-decay-iters 10 \
 --lr-decay-style cosine \
 --lr-warmup-iters 5 \
 --weight-decay .1 \
@@ -39,8 +39,8 @@ GPT_ARGS="\
 --bf16 \
 --fim-rate 0 \
 --log-interval 10 \
---save-interval 2500 \
---eval-interval 2500 \
+--save-interval 10 \
+--eval-interval 10 \
 --eval-iters 2 \
 --valid-num-workers 0 \
 --structured-logs \
@@ -62,5 +62,5 @@ torchrun $DISTRIBUTED_ARGS \
     --tokenizer-file $TOKENIZER_PATH \
     --save $CHECKPOINT_PATH \
     --load $CHECKPOINT_PATH \
-    --data-path data/debug_text_document \
+    --data-path ../Granite-Megatron-LM/data/dataset=Dockerfile \
     --no-gradient-accumulation-fusion

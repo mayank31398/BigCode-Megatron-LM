@@ -350,6 +350,10 @@ class _HFTokenizer(AbstractTokenizer):
     def eod(self):
         return self.eod_id
 
+    @property
+    def pad(self):
+        return self.tokenizer.pad_token_id
+
 
 class _SentencePieceTokenizer(AbstractTokenizer):
     """SentencePieceTokenizer-Megatron wrapper"""

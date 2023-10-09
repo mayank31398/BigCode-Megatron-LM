@@ -155,6 +155,8 @@ class ParallelMLP(MegatronModule):
         # [s, b, 4hp]
         intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
 
+        # return intermediate_parallel, bias_parallel
+
         if self.bias_gelu_fusion:
             assert self.add_bias is True
             assert self.activation_func == F.gelu
@@ -163,6 +165,8 @@ class ParallelMLP(MegatronModule):
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
             intermediate_parallel = self.activation_func(intermediate_parallel)
+
+        # return intermediate_parallel, 0
 
         # [s, b, h]
         output, output_bias = self.dense_4h_to_h(intermediate_parallel)
@@ -454,8 +458,8 @@ class MultiQueryCoreAttention(CoreAttention):
         # seem a bit unusual, but is taken from the original Transformer paper.
 
         if not self.sequence_parallel:
-            with tensor_parallel.get_cuda_rng_tracker().fork():
-                attention_probs = self.attention_dropout(attention_probs)
+            # with tensor_parallel.get_cuda_rng_tracker().fork():
+            attention_probs = self.attention_dropout(attention_probs)
         else:
             attention_probs = self.attention_dropout(attention_probs)
 
@@ -828,6 +832,9 @@ class ParallelAttention(MegatronModule):
             new_tensor_shape = query_layer.size()[:-1] + \
                 (self.num_attention_heads_per_partition,
                  self.hidden_size_per_attention_head)
+            # return query_layer, None
+            # return key_layer.squeeze(2), None
+            # return value_layer.squeeze(2), None
             query_layer = query_layer.view(*new_tensor_shape)
 
             # [sq, b, np, hn] -> [b, np * sq, hn]
@@ -955,6 +962,7 @@ class ParallelAttention(MegatronModule):
                 context_layer = self.core_attention(
                     query_layer, key_layer, value_layer, attention_mask, alibi)
 
+        # return context_layer, None
 
         # =================
         # Output. [sq, b, h]
@@ -1324,8 +1332,14 @@ class ParallelTransformerLayer(MegatronModule):
                 rotary_pos_emb=None):
         # hidden_states: [s, b, h]
 
+        # return hidden_states
+
         # Layer norm at the beginning of the transformer layer.
+        # return self.input_layernorm.weight.unsqueeze(0)
+        # return self.input_layernorm.bias.unsqueeze(0)
         layernorm_output = self.input_layernorm(hidden_states)
+
+        # return layernorm_output
 
         # Self attention.
         attention_output, attention_bias = \
@@ -1335,6 +1349,8 @@ class ParallelTransformerLayer(MegatronModule):
                 inference_params=inference_params,
                 alibi=self.alibi,
                 rotary_pos_emb=rotary_pos_emb)
+
+        # return attention_output + attention_bias
 
         # Residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -1369,8 +1385,12 @@ class ParallelTransformerLayer(MegatronModule):
                                               training=self.training)
             layernorm_input = residual + self.drop_path(out)
 
+        # return layernorm_input
+
         # Layer norm post the self attention.
         layernorm_output = self.post_attention_layernorm(layernorm_input)
+
+        # return layernorm_output
 
         # Cross attention.
         if self.layer_type == LayerType.encoder:
@@ -1407,6 +1427,8 @@ class ParallelTransformerLayer(MegatronModule):
 
         # MLP.
         mlp_output, mlp_bias = self.mlp(layernorm_output)
+
+        # return mlp_output + mlp_bias
 
         # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
